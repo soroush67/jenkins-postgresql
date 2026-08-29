@@ -1,0 +1,196 @@
+---
+# Permission strategy (checked directly, not guessed - see the root
+# README's Design notes for the real mistake this replaced): Ansible
+# itself always runs unprivileged (become: false, matching this user's
+# other Ansible+Jenkins projects) and can never chown a path to a uid it
+# doesn't own. Two different fixes are needed depending on whether the
+# postgres image's own uid (70) needs to WRITE into a path or just READ
+# it:
+#   - pg_data_root / pg_logs_root (read-write mounts): created once and
+#     handed over to uid 70 entirely (owner+mode via a throwaway
+#     container) - and never touched again by Ansible afterward, checked
+#     via `stat` first, since re-chowning an already-handed-over
+#     directory on every rerun would eventually lock this deploying user
+#     out of even listing it (confirmed directly: a first attempt
+#     `chown -R` on the top-level directories broke `ls` and every
+#     subsequent Ansible run on the *directories themselves*, not just
+#     their contents).
+#   - config/init (read-only mounts): directories stay owned by this
+#     deploying user with mode 0751 (owner: full, other: traverse-only,
+#     no listing) - traverse-only is enough for uid 70/65534 to open a
+#     specific file by its exact bind-mounted path without needing
+#     ownership of the directory at all. Files with no secrets
+#     (postgresql.conf, pg_hba.conf, postgres_exporter.yml) are then
+#     just world-readable (0644). The one file that DOES hold a secret
+#     (the exporter-user init SQL) is instead chowned to uid 70 with
+#     0400 (owner-read-only) via the same throwaway-container trick,
+#     removed and re-rendered on every run first so a changed
+#     pg_exporter_password doesn't get stuck behind its own previous
+#     0400 lockout.
+
+- name: Ensure the compose directory exists
+  file:
+    path: "{{ pg_compose_root }}"
+    state: directory
+    mode: "0750"
+
+- name: Ensure the read-only config/init directories exist (traversable by the container, not owned by it)
+  # 0755, not 0751 - the postgres entrypoint script `ls`'s
+  # /docker-entrypoint-initdb.d/ to discover init scripts, which needs
+  # LIST (read) permission on the directory itself, not just traverse.
+  # Confirmed directly: 0751 alone left postgres unable to even list the
+  # directory ("ls: can't open '/docker-entrypoint-initdb.d/': Permission
+  # denied"), independent of the init SQL file's own 0400 lockdown below
+  # (which still protects its *contents* even though its *filename* is
+  # now visible via listing).
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ pg_config_root }}"
+    - "{{ pg_config_root }}/postgres-exporter"
+    - "{{ pg_init_root }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Render postgresql.conf (world-readable - no secrets)
+  template:
+    src: "{{ pg_project_root }}/templates/postgresql.conf.j2"
+    dest: "{{ pg_config_root }}/postgresql.conf"
+    mode: "0644"
+
+- name: Render pg_hba.conf (world-readable - no secrets)
+  template:
+    src: "{{ pg_project_root }}/templates/pg_hba.conf.j2"
+    dest: "{{ pg_config_root }}/pg_hba.conf"
+    mode: "0644"
+
+- name: Render postgres_exporter.yml (world-readable - no secrets)
+  template:
+    src: "{{ pg_project_root }}/templates/postgres_exporter.yml.j2"
+    dest: "{{ pg_config_root }}/postgres-exporter/postgres_exporter.yml"
+    mode: "0644"
+
+- name: Remove any previous init SQL before re-rendering
+  # It may be owned by uid 70 mode 0400 from a previous run (see below) -
+  # this deploying user couldn't overwrite it directly if
+  # pg_exporter_password changed, so always clear it first via the same
+  # throwaway-container trick, then render fresh every time.
+  command: >-
+    docker run --rm -v {{ pg_init_root }}:/target
+    --entrypoint rm
+    {{ pg_postgres_image }}
+    -f /target/01-create-exporter-user.sql
+  changed_when: true
+
+- name: Render the exporter-user init SQL (still owned by this deploying user for now)
+  template:
+    src: "{{ pg_project_root }}/templates/01-create-exporter-user.sql.j2"
+    dest: "{{ pg_init_root }}/01-create-exporter-user.sql"
+    mode: "0600"
+
+- name: Lock the exporter-user init SQL down to the postgres image's own uid
+  # 0400, owner-read-only - contains pg_exporter_password in plaintext.
+  command: >-
+    docker run --rm -v {{ pg_init_root }}:/target
+    --entrypoint sh
+    {{ pg_postgres_image }}
+    -c "chown {{ pg_run_uid }}:{{ pg_run_gid }} /target/01-create-exporter-user.sql && chmod 0400 /target/01-create-exporter-user.sql"
+  changed_when: true
+
+- name: Render this host's docker-compose.yml
+  template:
+    src: "{{ pg_project_root }}/templates/docker-compose.yml.j2"
+    dest: "{{ pg_compose_root }}/docker-compose.yml"
+    mode: "0640"
+
+- name: Check whether the data directory already exists
+  stat:
+    path: "{{ pg_data_root }}"
+  register: pg_data_dir_stat
+
+- name: Create and hand over the data directory to the postgres image's own uid (only on first deploy)
+  # Handed over entirely (owner uid 70, mode 0700) and never touched
+  # again afterward - this deploying user only ever needs to confirm it
+  # EXISTS (the stat above, which needs no permission on the target
+  # itself, only its parent) on subsequent runs, not manage its
+  # contents.
+  command: >-
+    docker run --rm -v {{ pg_project_root }}:/project
+    --entrypoint sh
+    {{ pg_postgres_image }}
+    -c "mkdir -p /project/data && chown {{ pg_run_uid }}:{{ pg_run_gid }} /project/data && chmod 0700 /project/data"
+  changed_when: true
+  when: not pg_data_dir_stat.stat.exists
+
+- name: Check whether the logs directory already exists
+  stat:
+    path: "{{ pg_logs_root }}"
+  register: pg_logs_dir_stat
+
+- name: Create and hand over the logs directory to the postgres image's own uid (only on first deploy)
+  command: >-
+    docker run --rm -v {{ pg_project_root }}:/project
+    --entrypoint sh
+    {{ pg_postgres_image }}
+    -c "mkdir -p /project/logs && chown {{ pg_run_uid }}:{{ pg_run_gid }} /project/logs && chmod 0700 /project/logs"
+  changed_when: true
+  when: not pg_logs_dir_stat.stat.exists
+
+- name: Start (or reconcile) postgres + postgres_exporter
+  command: "{{ pg_compose_cmd }} -f {{ pg_compose_root }}/docker-compose.yml up -d"
+  args:
+    chdir: "{{ pg_compose_root }}"
+  changed_when: true
+
+- name: Wait for postgres to become healthy
+  command: >-
+    docker inspect --format="{{ '{{' }}.State.Health.Status{{ '}}' }}" {{ pg_container_name }}
+  register: pg_health_check
+  until: pg_health_check.stdout == "healthy"
+  retries: 24
+  delay: 5
+  changed_when: false
+
+- name: Sync the exporter role's password with the current declared secret
+  # docker-entrypoint-initdb.d scripts (including the init SQL rendered
+  # above) only ever run once, against a genuinely empty data directory -
+  # a redeploy with a changed pg_exporter_password would otherwise
+  # silently desync from the actual DB role's password. Idempotent
+  # either way (first deploy or redeploy): always brings the role's
+  # password in line with what's currently declared.
+  command: >-
+    docker exec
+    -e PGPASSWORD={{ pg_password }}
+    {{ pg_container_name }}
+    psql -U {{ pg_user }} -d {{ pg_db }} -h 127.0.0.1
+    -c "ALTER USER {{ pg_exporter_user }} WITH PASSWORD '{{ pg_exporter_password }}';"
+  changed_when: true
+
+- name: Wait for postgres_exporter to become healthy
+  command: >-
+    docker inspect --format="{{ '{{' }}.State.Running{{ '}}' }}" {{ pg_exporter_container_name }}
+  register: pg_exporter_running_check
+  until: pg_exporter_running_check.stdout == "true"
+  retries: 12
+  delay: 5
+  changed_when: false
+
+- name: Verify postgres_exporter can actually reach and authenticate to postgres
+  # Proves the username fix and network fix both actually work, not just
+  # that both containers started - /metrics only returns real
+  # pg_up-style data if the exporter's own DB connection succeeded.
+  uri:
+    url: "http://127.0.0.1:{{ pg_exporter_port }}/metrics"
+    return_content: true
+  register: pg_exporter_metrics
+  until: "'pg_up 1' in pg_exporter_metrics.content"
+  retries: 12
+  delay: 5
+
+- name: Report deployment complete
+  debug:
+    msg: >-
+      postgres: healthy (port {{ pg_port }}). postgres_exporter: authenticated
+      and scraping (port {{ pg_exporter_port }}/metrics, pg_up 1).

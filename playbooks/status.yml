@@ -1,0 +1,38 @@
+---
+- name: PostgreSQL stack status (read-only - safe to run anytime)
+  hosts: postgres
+  gather_facts: false
+  tasks:
+    - name: Check container health/running state
+      command: >-
+        docker inspect --format="{{ '{{' }}.Name{{ '}}' }}: {{ '{{' }}.State.Status{{ '}}' }}{{ '{{' }}if .State.Health{{ '}}' }} ({{ '{{' }}.State.Health.Status{{ '}}' }}){{ '{{' }}end{{ '}}' }}"
+        {{ item }}
+      loop:
+        - "{{ pg_container_name }}"
+        - "{{ pg_exporter_container_name }}"
+      loop_control:
+        label: "{{ item }}"
+      register: pg_status_result
+      changed_when: false
+      failed_when: false
+
+    - name: Report status
+      debug:
+        msg: "{{ item.stdout | default('not running / not found: ' + item.item) }}"
+      loop: "{{ pg_status_result.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Check exporter metrics endpoint
+      uri:
+        url: "http://127.0.0.1:{{ pg_exporter_port }}/metrics"
+        return_content: true
+      register: pg_status_metrics
+      failed_when: false
+
+    - name: Report exporter connectivity
+      debug:
+        msg: >-
+          {{ 'postgres_exporter: authenticated and scraping (pg_up 1)'
+             if (pg_status_metrics.content is defined and 'pg_up 1' in pg_status_metrics.content)
+             else 'postgres_exporter: NOT reporting pg_up 1 - check docker logs ' + pg_exporter_container_name }}

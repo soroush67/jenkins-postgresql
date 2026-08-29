@@ -1,0 +1,122 @@
+---
+- name: Assert required secrets are set
+  assert:
+    that:
+      - pg_password | length > 0
+      - pg_exporter_password | length > 0
+    fail_msg: "pg_password and pg_exporter_password must both be set (-e, Ansible Vault, or a Jenkins credential binding) - never committed."
+
+- name: Check this user can actually talk to the Docker daemon
+  command: docker info
+  register: preflight_docker_check
+  changed_when: false
+  failed_when: false
+
+- name: Fail cleanly if the Docker daemon isn't reachable
+  assert:
+    that: preflight_docker_check.rc == 0
+    fail_msg: >-
+      Can't talk to the Docker daemon (docker info failed):
+      {{ preflight_docker_check.stderr }}
+      Usually means this user isn't in the `docker` group:
+      `sudo usermod -aG docker $(whoami)`, then restart whatever runs this playbook.
+    success_msg: "Docker daemon reachable."
+
+- name: Check whether the docker compose plugin (v2, `docker compose`) is available
+  command: docker compose version
+  register: preflight_compose_plugin_check
+  changed_when: false
+  failed_when: false
+
+- name: Check whether the standalone docker-compose binary is available
+  # Both forms are real in the wild - confirmed this environment only
+  # has the standalone binary, same finding as CockroachDB-Cluster.
+  command: docker-compose version
+  register: preflight_compose_standalone_check
+  changed_when: false
+  failed_when: false
+  when: preflight_compose_plugin_check.rc != 0
+
+- name: Record which docker compose command form this host actually has
+  set_fact:
+    pg_compose_cmd: >-
+      {{ 'docker compose' if preflight_compose_plugin_check.rc == 0
+         else 'docker-compose' if preflight_compose_standalone_check.rc | default(1) == 0
+         else '' }}
+
+- name: Fail cleanly if neither docker compose form is available
+  assert:
+    that: pg_compose_cmd | length > 0
+    fail_msg: "Neither `docker compose` (plugin) nor `docker-compose` (standalone) is available on this host."
+    success_msg: "Compose command available: {{ pg_compose_cmd }}"
+
+- name: Refuse to deploy onto the root filesystem when a dedicated mount is required
+  command: "mountpoint -q {{ pg_data_root }}"
+  register: preflight_mount_check
+  changed_when: false
+  failed_when: false
+  when: pg_require_dedicated_mount | bool
+
+- name: Fail cleanly if pg_data_root isn't actually a separate mount
+  assert:
+    that: preflight_mount_check.rc == 0
+    fail_msg: >-
+      pg_require_dedicated_mount is true but {{ pg_data_root }} is not a
+      real mountpoint - refusing to deploy (the intended data disk likely
+      failed to mount; PostgreSQL would otherwise write onto the OS
+      filesystem). Mount the real disk, or set
+      pg_require_dedicated_mount: false if this is intentional.
+    success_msg: "{{ pg_data_root }} is a dedicated mount."
+  when: pg_require_dedicated_mount | bool
+
+- name: Check the SQL port is free on this host
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ pg_port }}"
+    state: stopped
+    timeout: 1
+  register: preflight_sql_port_check
+  failed_when: false
+
+- name: Check the exporter port is free on this host
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ pg_exporter_port }}"
+    state: stopped
+    timeout: 1
+  register: preflight_exporter_port_check
+  failed_when: false
+
+- name: Fail cleanly if a required port is already in use by something else
+  assert:
+    that: item.failed | default(false) == false
+    fail_msg: >-
+      Port already in use: {{ item.item }} - if this is an already-running
+      container from a previous deploy, check `docker ps` rather than
+      forcing the port free.
+    success_msg: "Port {{ item.item }} free."
+  loop:
+    - "{{ preflight_sql_port_check | combine({'item': pg_port}) }}"
+    - "{{ preflight_exporter_port_check | combine({'item': pg_exporter_port}) }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Ensure the external Docker networks exist
+  # `external: true` in the compose file means it expects these to
+  # already be there - created here (idempotently) rather than requiring
+  # a separate manual step before every deploy.
+  command: "docker network inspect {{ item }}"
+  register: preflight_network_check
+  loop: "{{ pg_networks }}"
+  loop_control:
+    label: "{{ item }}"
+  changed_when: false
+  failed_when: false
+
+- name: Create any missing external Docker networks
+  command: "docker network create {{ item.item }}"
+  loop: "{{ preflight_network_check.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.rc != 0
+  changed_when: true

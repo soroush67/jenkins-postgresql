@@ -1,0 +1,90 @@
+---
+# Full image references, not a registry-prefix var like this user's other
+# projects (CockroachDB-Cluster, gitlab-backup-with-jenkins-ansible) -
+# their internal registry doesn't just prefix the public image path for
+# postgres-exporter (docker-hosted.hamainsurance.net/postgres-exporter,
+# not .../prometheuscommunity/postgres-exporter), so a prefix-only
+# substitution wouldn't work here. Override the whole var for local
+# testing instead, e.g.:
+#   -e pg_postgres_image=postgres:18.4-alpine3.22
+#   -e pg_exporter_image=prometheuscommunity/postgres-exporter:v0.18.1
+pg_postgres_image: "docker-hosted.hamainsurance.net/postgres:18.4-alpine3.22"
+pg_exporter_image: "docker-hosted.hamainsurance.net/postgres-exporter:v0.18.1"
+
+pg_project_root: "{{ playbook_dir }}/.."
+
+# Matches the original hand-written stack's own relative layout
+# (config/, init/, data/, logs/ next to the compose file) - only the
+# rendered docker-compose.yml itself is host-scoped, for the same reason
+# CockroachDB-Cluster's compose files are: safe if this same mechanism
+# is ever pointed at more than one inventory host sharing a filesystem.
+pg_data_root: "{{ pg_project_root }}/data"
+pg_config_root: "{{ pg_project_root }}/config"
+pg_logs_root: "{{ pg_project_root }}/logs"
+pg_init_root: "{{ pg_project_root }}/init"
+pg_compose_root: "{{ pg_project_root }}/compose/{{ inventory_hostname }}"
+
+# PRODUCTION: point pg_data_root at a real, dedicated disk mount and set
+# this true - see roles/preflight, which then refuses to deploy unless
+# it's a genuine separate mountpoint. Off by default (this sandbox has
+# no second disk), same convention as CockroachDB-Cluster.
+pg_require_dedicated_mount: false
+
+pg_container_name: "postgresql"
+pg_exporter_container_name: "pg-exporter"
+
+pg_db: "appdb"
+pg_user: "appuser"
+# Must be set via -e / Ansible Vault / a Jenkins credential binding -
+# never committed. Deploy fails cleanly (roles/postgres asserts this) if
+# left empty.
+pg_password: ""
+
+# Was "pg_exporter" in the original init/01-create-exporter-user.sql but
+# "postgres_exporter" in docker-compose.yml's own DATA_SOURCE_NAME - a
+# real mismatch that would have made the exporter fail to authenticate
+# on first boot (confirmed by reading both files; never actually ran
+# successfully together). Standardized on postgres_exporter here - both
+# the rendered init SQL and the compose file's connection string now
+# come from this one variable, so they can't drift again.
+pg_exporter_user: "postgres_exporter"
+pg_exporter_password: ""
+
+pg_port: 5432
+pg_exporter_port: 9187
+
+pg_timezone: "Asia/Tehran"
+pg_max_connections: 100
+pg_shared_buffers: "256MB"
+
+# The postgres image's own built-in non-root user - confirmed directly
+# (`getent passwd postgres` inside postgres:18.4-alpine3.22 → uid/gid
+# 70). Used for both the compose `user:` directive and chowning
+# pg_data_root, so the container never needs to run as root at all (no
+# gosu/chown-as-root dance, no CAP_CHOWN/CAP_SETUID needed) - re-verify
+# this value if the base image's major Alpine version ever changes.
+pg_run_uid: 70
+pg_run_gid: 70
+# postgres-exporter's own built-in non-root user (confirmed directly:
+# uid/gid 65534, "nobody").
+pg_exporter_run_uid: 65534
+pg_exporter_run_gid: 65534
+
+# host all all <this>: the original file had 0.0.0.0/0 (fully open,
+# password-required) alongside a published port - kept as the default
+# here since that appears to be an intentional "reachable from outside
+# this host" design (not touched without being asked), but is now
+# configurable. Narrow this to a real CIDR if external reach was never
+# actually intended.
+pg_hba_allowed_cidr: "0.0.0.0/0"
+
+# external: true in the compose file - must already exist on the
+# target host. roles/preflight creates them if missing (idempotent),
+# rather than requiring a separate manual step.
+pg_networks:
+  - back-net
+  - db-net
+
+pg_mem_limit: "1024m"
+pg_mem_reservation: "128m"
+pg_cpus: "0.5"

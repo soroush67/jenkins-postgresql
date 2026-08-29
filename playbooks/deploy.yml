@@ -1,0 +1,7 @@
+---
+- name: Deploy PostgreSQL + postgres_exporter (idempotent - safe to rerun)
+  hosts: postgres
+  gather_facts: true
+  roles:
+    - preflight
+    - postgres

@@ -1,0 +1,10 @@
+data/
+logs/
+compose/
+config/postgresql.conf
+config/pg_hba.conf
+config/postgres-exporter/postgres_exporter.yml
+init/01-create-exporter-user.sql
+.env
+.ansible-retry/
+*.retry
