@@ -28,17 +28,54 @@
 #     pg_exporter_password doesn't get stuck behind its own previous
 #     0400 lockout.
 
-- name: Ensure the deploy path itself exists
-  # In case pg_deploy_path is a fresh directory (e.g. a real DEPLOY_PATH
-  # that's never been used before) - `file: state: directory` on the
-  # subdirectories below would create this as an implicit parent anyway,
-  # but doing it explicitly here gives a clearer failure if this
-  # deploying user can't write to pg_deploy_path's own parent (e.g. an
-  # unwritable /opt) than a confusing failure three tasks later.
+- name: Determine the deploying user's own uid/gid on this host
+  # Needed below whenever a directory has to be created via the
+  # privileged-container fallback (mounting the host filesystem as
+  # root) - so it comes back owned by this same deploying user, not
+  # root, and Ansible can keep managing it normally afterward.
+  command: id -u
+  register: pg_deploy_uid
+  changed_when: false
+
+- name: Determine the deploying user's own gid
+  command: id -g
+  register: pg_deploy_gid
+  changed_when: false
+
+- name: Try to ensure the deploy path itself exists
+  # Plain attempt first - works whenever this deploying user can already
+  # write to pg_deploy_path's own parent (the common case: a path under
+  # their own home/workspace). ignore_errors, NOT failed_when: false -
+  # confirmed directly that failed_when: false rewrites the registered
+  # result's own `failed` key to false even when the underlying mkdir
+  # genuinely failed, which silently broke the `is failed` check on the
+  # fallback below (it never ran) the first time this was written.
+  # ignore_errors keeps the play going the same way, but the registered
+  # result still correctly reports what actually happened.
   file:
     path: "{{ pg_deploy_path }}"
     state: directory
     mode: "0755"
+  register: pg_deploy_path_direct
+  ignore_errors: true
+
+- name: Create the deploy path via a privileged container (fallback)
+  # Only runs if the plain attempt above failed - e.g. a fresh
+  # DEPLOY_PATH whose parent this deploying user can't write to directly
+  # (confirmed for real: a real deploy hit exactly this for /data, a
+  # root-owned top-level directory). Mounts the host's own filesystem
+  # root into a throwaway container (needs docker daemon access, which
+  # roles/preflight already requires) purely to mkdir + chown - the same
+  # "elevate via docker run, never via become/sudo" pattern already used
+  # throughout this role instead of assuming passwordless sudo is
+  # configured on the target.
+  command: >-
+    docker run --rm -v /:/hostroot
+    --entrypoint sh
+    {{ pg_postgres_image }}
+    -c "mkdir -p /hostroot{{ pg_deploy_path }} && chown {{ pg_deploy_uid.stdout }}:{{ pg_deploy_gid.stdout }} /hostroot{{ pg_deploy_path }} && chmod 0755 /hostroot{{ pg_deploy_path }}"
+  when: pg_deploy_path_direct is failed
+  changed_when: true
 
 - name: Ensure the read-only config/init directories exist (traversable by the container, not owned by it)
   # 0755, not 0751 - the postgres entrypoint script `ls`'s
@@ -122,17 +159,33 @@
     dest: "{{ pg_deploy_path }}/docker-compose.yml"
     mode: "0640"
 
-- name: Ensure the volumes root exists
-  # /data/<last folder of pg_deploy_path> - a plain, soroush-owned
-  # directory (0755). Only the data/logs subdirectories beneath it get
-  # handed over to uid 70 individually, below - this directory itself
-  # never needs to be, so no lockout risk here (unlike a bare `-v` mount
-  # trick, which would leave Docker's own auto-created parent dir
-  # root-owned instead).
+- name: Try to ensure the volumes root exists directly
+  # /data/<last folder of pg_deploy_path> - a plain, this-deploying-user-
+  # owned directory (0755). Only the data/logs subdirectories beneath it
+  # get handed over to uid 70 individually, below - this directory
+  # itself never needs to be, so no lockout risk here. ignore_errors,
+  # not failed_when: false - see the identical note on "Try to ensure
+  # the deploy path itself exists" above; the fallback below handles the
+  # common real case: /data itself is a fresh, root-owned top-level
+  # directory this deploying user can't create directly (confirmed for
+  # real: a live deploy failed outright here with "Permission denied:
+  # b'/data'").
   file:
     path: "{{ pg_volumes_root }}"
     state: directory
     mode: "0755"
+  register: pg_volumes_root_direct
+  ignore_errors: true
+
+- name: Create the volumes root via a privileged container (fallback)
+  # Same reasoning and pattern as the deploy-path fallback above.
+  command: >-
+    docker run --rm -v /:/hostroot
+    --entrypoint sh
+    {{ pg_postgres_image }}
+    -c "mkdir -p /hostroot{{ pg_volumes_root }} && chown {{ pg_deploy_uid.stdout }}:{{ pg_deploy_gid.stdout }} /hostroot{{ pg_volumes_root }} && chmod 0755 /hostroot{{ pg_volumes_root }}"
+  when: pg_volumes_root_direct is failed
+  changed_when: true
 
 - name: Check whether the data directory already exists
   stat:

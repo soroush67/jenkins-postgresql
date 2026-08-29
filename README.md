@@ -220,16 +220,46 @@ pg_deploy_path>` - so `DEPLOY_PATH=/opt/servers/pg-prod-1` puts
 actual `data`/`logs` volumes at `/data/pg-prod-1`, namespaced so
 multiple instances deployed with different `DEPLOY_PATH`s don't collide
 under `/data`. Two things confirmed directly rather than assumed while
-building this: Jinja's `basename` filter returns an *empty string* for a
-path ending in `/` (so `DEPLOY_PATH=/opt/pg-prod-1/` would otherwise
-have put volumes at the literal path `/data/`) - stripped with
-`regex_replace('/+$', '')` first; and `roles/preflight`'s
-`pg_require_dedicated_mount` check needed to move from checking
-`pg_data_root` to a dedicated `pg_dedicated_mount_check_path` (`/data`
-by default) - `mountpoint -q` only ever holds true for the actual mount
-boundary itself, never a subdirectory beneath it, so checking
-`pg_data_root` (now several directories under `/data`) would have failed
-even when `/data` genuinely was the dedicated mount.
+building this: Jinja's `basename` filter doesn't resolve `..`
+semantically (`pg_deploy_path`'s own default,
+`"{{ playbook_dir }}/.."`, is a literal string ending in `/..` -
+`basename` on that really does return `".."` as a string, not the real
+parent folder name) - fixed with `realpath` first, which normalizes the
+path and works even for a `DEPLOY_PATH` that doesn't exist on disk yet;
+and `roles/preflight`'s `pg_require_dedicated_mount` check needed to
+move from checking `pg_data_root` to a dedicated
+`pg_dedicated_mount_check_path` (`/data` by default) - `mountpoint -q`
+only ever holds true for the actual mount boundary itself, never a
+subdirectory beneath it, so checking `pg_data_root` (now several
+directories under `/data`) would have failed even when `/data` genuinely
+was the dedicated mount.
+
+**A real deploy to an actual production host stopped outright because
+this deploying user couldn't create `/data` itself** - `[Errno 13]
+Permission denied: b'/data'`, confirmed via a real failed Jenkins run
+against a genuine target (`/data` there is a root-owned top-level
+directory, same as it would be on any fresh host with no prior setup).
+Fixed by trying the plain, fast path first (this deploying user
+creating `pg_deploy_path`/`pg_volumes_root` directly - works whenever
+they already have write access to the parent, which is the common case
+once a host has been deployed to once), and falling back to the same
+"elevate via a throwaway Docker container run as root, never via
+`become`/sudo" pattern already used throughout this role for every other
+uid handoff - mounts the host's own filesystem root, `mkdir`s and
+`chown`s the one directory back to this deploying user, then hands
+control straight back to plain Ansible for everything else. A real
+subtlety hit and fixed while building this: `failed_when: false` (the
+first attempt) doesn't just stop Ansible from halting the play on
+failure - it rewrites the registered result's own `failed` key to
+`false` too, confirmed directly, which silently broke the `is failed`
+check gating the fallback (it never ran, and a *later* task's own
+Docker-auto-created host directory quietly left the volumes root
+root-owned instead - worse than the original failure). `ignore_errors:
+true` was the actual fix: it keeps the play going the same way, but the
+registered result still correctly reflects what happened, so the
+fallback triggers exactly when it should and not otherwise (confirmed:
+a rerun after the fallback already ran takes the fast direct path again,
+since the directory is now correctly owned).
 
 **Verified end-to-end, not just "should work":** `postgres_exporter`'s
 own `/metrics` endpoint returns real `pg_up 1` (not just "container
