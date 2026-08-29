@@ -28,18 +28,40 @@ pg_project_root: "{{ playbook_dir }}/.."
 # from anywhere but this variable.
 pg_deploy_path: "{{ pg_project_root }}"
 
-# Matches the original hand-written stack's own relative layout
-# (config/, init/, data/, logs/ next to the compose file).
-pg_data_root: "{{ pg_deploy_path }}/data"
+# config/init (rendered config, not persistent data) stay next to
+# docker-compose.yml under pg_deploy_path, matching the original
+# hand-written stack's own relative layout.
 pg_config_root: "{{ pg_deploy_path }}/config"
-pg_logs_root: "{{ pg_deploy_path }}/logs"
 pg_init_root: "{{ pg_deploy_path }}/init"
 
-# PRODUCTION: point pg_data_root at a real, dedicated disk mount and set
-# this true - see roles/preflight, which then refuses to deploy unless
-# it's a genuine separate mountpoint. Off by default (this sandbox has
-# no second disk), same convention as CockroachDB-Cluster.
+# The actual data/log VOLUMES live under /data/<last folder of
+# pg_deploy_path> instead - e.g. DEPLOY_PATH=/opt/servers/pg-prod-1
+# puts docker-compose.yml/config/init at /opt/servers/pg-prod-1 but the
+# real persistent volumes at /data/pg-prod-1. Keeps stateful data on
+# this host's dedicated data mount (see pg_require_dedicated_mount
+# below) independent of wherever the compose definition itself happens
+# to live. `realpath`, not a bare `basename` - the default pg_deploy_path
+# ("{{ playbook_dir }}/..") is a literal string ending in "/..", and
+# basename doesn't resolve dot-segments semantically (confirmed
+# directly: Python's os.path.basename on a path ending in "/.." really
+# does return ".." as a string) - would have put every default-path
+# deployment's volumes at the nonsensical "/data/..". `realpath`
+# normalizes first (works even for a brand new DEPLOY_PATH that doesn't
+# exist yet, confirmed directly) and strips any trailing slash on its
+# own too.
+pg_volumes_root: "/data/{{ (pg_deploy_path | realpath) | basename }}"
+pg_data_root: "{{ pg_volumes_root }}/data"
+pg_logs_root: "{{ pg_volumes_root }}/logs"
+
+# PRODUCTION: mount a real, dedicated disk at /data and set this true -
+# see roles/preflight, which then refuses to deploy unless /data is a
+# genuine separate mountpoint (not pg_volumes_root or pg_data_root
+# themselves - those are subdirectories under /data, and `mountpoint -q`
+# only ever holds true for the actual mount boundary, confirmed the same
+# way CockroachDB-Cluster's own preflight check works). Off by default
+# (this sandbox has no second disk).
 pg_require_dedicated_mount: false
+pg_dedicated_mount_check_path: "/data"
 
 pg_container_name: "postgresql"
 pg_exporter_container_name: "pg-exporter"

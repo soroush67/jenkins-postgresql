@@ -36,10 +36,12 @@ this isn't `--limit` or `-i "<ip>,"`):
 ansible-playbook playbooks/deploy.yml -e target_host=10.0.1.50 -e pg_password='...' -e pg_exporter_password='...'
 ```
 
-Add `-e pg_deploy_path=/opt/pg-stack` (Jenkins: `DEPLOY_PATH`) to pin
-exactly where `docker-compose.yml` + `data`/`config`/`init`/`logs` get
-created - the only path this ever writes to. Defaults to the repo
-checkout directory when not set.
+Add `-e pg_deploy_path=/opt/servers/pg-prod-1` (Jenkins: `DEPLOY_PATH`)
+to pin exactly where `docker-compose.yml` + `config`/`init` get created
+- the only path those ever write to. Defaults to the repo checkout
+directory when not set. The actual data/log **volumes** land separately,
+under `/data/<the last folder of pg_deploy_path>` (`/data/pg-prod-1` for
+the example above) - see "Design notes" for why these are split apart.
 
 Testing against the public images instead of the internal registry
 (this sandbox can't reach `docker-hosted.hamainsurance.net`):
@@ -203,6 +205,31 @@ still accepting any destination at runtime - confirmed directly, not
 assumed, including that a `target_host` run touches only itself and a
 target_host-less run correctly falls back to whatever's in
 `inventory/hosts.ini`.
+
+**Volumes needed to live on the host's dedicated data disk
+(`/data`), independent of wherever `DEPLOY_PATH` puts
+`docker-compose.yml`/`config`/`init`.** Originally `pg_data_root`/
+`pg_logs_root` were just subdirectories of `pg_deploy_path` alongside
+everything else - fine as long as `DEPLOY_PATH` itself was already on
+the right disk, but not once the compose definition and the actual
+stateful data are meant to live in different places entirely (e.g.
+`docker-compose.yml` under a Jenkins-managed path, real data under
+`/data`). Split `pg_volumes_root` out as `/data/<the last folder of
+pg_deploy_path>` - so `DEPLOY_PATH=/opt/servers/pg-prod-1` puts
+`docker-compose.yml`/`config`/`init` at `/opt/servers/pg-prod-1` but the
+actual `data`/`logs` volumes at `/data/pg-prod-1`, namespaced so
+multiple instances deployed with different `DEPLOY_PATH`s don't collide
+under `/data`. Two things confirmed directly rather than assumed while
+building this: Jinja's `basename` filter returns an *empty string* for a
+path ending in `/` (so `DEPLOY_PATH=/opt/pg-prod-1/` would otherwise
+have put volumes at the literal path `/data/`) - stripped with
+`regex_replace('/+$', '')` first; and `roles/preflight`'s
+`pg_require_dedicated_mount` check needed to move from checking
+`pg_data_root` to a dedicated `pg_dedicated_mount_check_path` (`/data`
+by default) - `mountpoint -q` only ever holds true for the actual mount
+boundary itself, never a subdirectory beneath it, so checking
+`pg_data_root` (now several directories under `/data`) would have failed
+even when `/data` genuinely was the dedicated mount.
 
 **Verified end-to-end, not just "should work":** `postgres_exporter`'s
 own `/metrics` endpoint returns real `pg_up 1` (not just "container

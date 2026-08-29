@@ -122,6 +122,18 @@
     dest: "{{ pg_deploy_path }}/docker-compose.yml"
     mode: "0640"
 
+- name: Ensure the volumes root exists
+  # /data/<last folder of pg_deploy_path> - a plain, soroush-owned
+  # directory (0755). Only the data/logs subdirectories beneath it get
+  # handed over to uid 70 individually, below - this directory itself
+  # never needs to be, so no lockout risk here (unlike a bare `-v` mount
+  # trick, which would leave Docker's own auto-created parent dir
+  # root-owned instead).
+  file:
+    path: "{{ pg_volumes_root }}"
+    state: directory
+    mode: "0755"
+
 - name: Check whether the data directory already exists
   stat:
     path: "{{ pg_data_root }}"
@@ -134,7 +146,7 @@
   # itself, only its parent) on subsequent runs, not manage its
   # contents.
   command: >-
-    docker run --rm -v {{ pg_deploy_path }}:/project
+    docker run --rm -v {{ pg_volumes_root }}:/project
     --entrypoint sh
     {{ pg_postgres_image }}
     -c "mkdir -p /project/data && chown {{ pg_run_uid }}:{{ pg_run_gid }} /project/data && chmod 0700 /project/data"
@@ -148,7 +160,7 @@
 
 - name: Create and hand over the logs directory to the postgres image's own uid (only on first deploy)
   command: >-
-    docker run --rm -v {{ pg_deploy_path }}:/project
+    docker run --rm -v {{ pg_volumes_root }}:/project
     --entrypoint sh
     {{ pg_postgres_image }}
     -c "mkdir -p /project/logs && chown {{ pg_run_uid }}:{{ pg_run_gid }} /project/logs && chmod 0700 /project/logs"

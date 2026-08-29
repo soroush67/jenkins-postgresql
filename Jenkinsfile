@@ -49,7 +49,7 @@ pipeline {
         string(
             name: 'DEPLOY_PATH',
             defaultValue: '',
-            description: 'Absolute path on TARGET_HOST where docker-compose.yml + data/config/init/logs get created - the ONLY path this ever writes to, nothing else. Leave blank to use the Jenkins workspace checkout directory instead (local/manual testing).'
+            description: 'Absolute path on TARGET_HOST where docker-compose.yml + config/init get created. The actual data/log VOLUMES land separately, under /data/<the last folder of this path> (e.g. DEPLOY_PATH=/opt/servers/pg-prod-1 -> volumes at /data/pg-prod-1). Leave blank to use the Jenkins workspace checkout directory instead (local/manual testing).'
         )
     }
 

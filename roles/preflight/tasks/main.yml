@@ -51,22 +51,29 @@
     success_msg: "Compose command available: {{ pg_compose_cmd }}"
 
 - name: Refuse to deploy onto the root filesystem when a dedicated mount is required
-  command: "mountpoint -q {{ pg_data_root }}"
+  # Checks pg_dedicated_mount_check_path (the actual mount boundary,
+  # /data by default), not pg_data_root/pg_volumes_root - those are
+  # subdirectories *under* /data (pg_volumes_root namespaces by
+  # DEPLOY_PATH's own last folder), and `mountpoint -q` only ever holds
+  # true for the real mount point itself, not an arbitrary directory
+  # beneath it.
+  command: "mountpoint -q {{ pg_dedicated_mount_check_path }}"
   register: preflight_mount_check
   changed_when: false
   failed_when: false
   when: pg_require_dedicated_mount | bool
 
-- name: Fail cleanly if pg_data_root isn't actually a separate mount
+- name: Fail cleanly if pg_dedicated_mount_check_path isn't actually a separate mount
   assert:
     that: preflight_mount_check.rc == 0
     fail_msg: >-
-      pg_require_dedicated_mount is true but {{ pg_data_root }} is not a
-      real mountpoint - refusing to deploy (the intended data disk likely
-      failed to mount; PostgreSQL would otherwise write onto the OS
-      filesystem). Mount the real disk, or set
+      pg_require_dedicated_mount is true but {{ pg_dedicated_mount_check_path }}
+      is not a real mountpoint - refusing to deploy (the intended data
+      disk likely failed to mount; PostgreSQL would otherwise write onto
+      the OS filesystem at {{ pg_data_root }}). Mount the real disk at
+      {{ pg_dedicated_mount_check_path }}, or set
       pg_require_dedicated_mount: false if this is intentional.
-    success_msg: "{{ pg_data_root }} is a dedicated mount."
+    success_msg: "{{ pg_dedicated_mount_check_path }} is a dedicated mount."
   when: pg_require_dedicated_mount | bool
 
 - name: Check the SQL port is free on this host
