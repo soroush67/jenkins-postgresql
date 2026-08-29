@@ -46,6 +46,11 @@ pipeline {
             defaultValue: '',
             description: 'IP or hostname to deploy to - any reachable destination, does NOT need to be pre-added to inventory/hosts.ini. Leave blank to use whatever is in inventory/hosts.ini instead (local/manual testing).'
         )
+        string(
+            name: 'DEPLOY_PATH',
+            defaultValue: '',
+            description: 'Absolute path on TARGET_HOST where docker-compose.yml + data/config/init/logs get created - the ONLY path this ever writes to, nothing else. Leave blank to use the Jenkins workspace checkout directory instead (local/manual testing).'
+        )
     }
 
     stages {
@@ -59,6 +64,7 @@ pipeline {
             when { expression { params.ACTION == 'deploy' } }
             environment {
                 TARGET_HOST = "${params.TARGET_HOST}"
+                DEPLOY_PATH = "${params.DEPLOY_PATH}"
             }
             steps {
                 withCredentials([
@@ -69,8 +75,11 @@ pipeline {
                         set -e
                         TARGET_HOST_ARG=""
                         [ -n "$TARGET_HOST" ] && TARGET_HOST_ARG="-e target_host=$TARGET_HOST"
+                        DEPLOY_PATH_ARG=""
+                        [ -n "$DEPLOY_PATH" ] && DEPLOY_PATH_ARG="-e pg_deploy_path=$DEPLOY_PATH"
                         ansible-playbook playbooks/deploy.yml \
                           $TARGET_HOST_ARG \
+                          $DEPLOY_PATH_ARG \
                           -e pg_password="$PG_PASSWORD" \
                           -e pg_exporter_password="$PG_EXPORTER_PASSWORD"
                     '''
@@ -82,13 +91,16 @@ pipeline {
             when { expression { params.ACTION == 'status' } }
             environment {
                 TARGET_HOST = "${params.TARGET_HOST}"
+                DEPLOY_PATH = "${params.DEPLOY_PATH}"
             }
             steps {
                 sh '''
                     set -e
                     TARGET_HOST_ARG=""
                     [ -n "$TARGET_HOST" ] && TARGET_HOST_ARG="-e target_host=$TARGET_HOST"
-                    ansible-playbook playbooks/status.yml $TARGET_HOST_ARG
+                    DEPLOY_PATH_ARG=""
+                    [ -n "$DEPLOY_PATH" ] && DEPLOY_PATH_ARG="-e pg_deploy_path=$DEPLOY_PATH"
+                    ansible-playbook playbooks/status.yml $TARGET_HOST_ARG $DEPLOY_PATH_ARG
                 '''
             }
         }

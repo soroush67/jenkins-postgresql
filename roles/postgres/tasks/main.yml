@@ -28,11 +28,17 @@
 #     pg_exporter_password doesn't get stuck behind its own previous
 #     0400 lockout.
 
-- name: Ensure the compose directory exists
+- name: Ensure the deploy path itself exists
+  # In case pg_deploy_path is a fresh directory (e.g. a real DEPLOY_PATH
+  # that's never been used before) - `file: state: directory` on the
+  # subdirectories below would create this as an implicit parent anyway,
+  # but doing it explicitly here gives a clearer failure if this
+  # deploying user can't write to pg_deploy_path's own parent (e.g. an
+  # unwritable /opt) than a confusing failure three tasks later.
   file:
-    path: "{{ pg_compose_root }}"
+    path: "{{ pg_deploy_path }}"
     state: directory
-    mode: "0750"
+    mode: "0755"
 
 - name: Ensure the read-only config/init directories exist (traversable by the container, not owned by it)
   # 0755, not 0751 - the postgres entrypoint script `ls`'s
@@ -64,6 +70,12 @@
   template:
     src: "{{ pg_project_root }}/templates/pg_hba.conf.j2"
     dest: "{{ pg_config_root }}/pg_hba.conf"
+    mode: "0644"
+
+- name: Render pg_ident.conf (world-readable - just a username mapping, no secrets)
+  template:
+    src: "{{ pg_project_root }}/templates/pg_ident.conf.j2"
+    dest: "{{ pg_config_root }}/pg_ident.conf"
     mode: "0644"
 
 - name: Render postgres_exporter.yml (world-readable - no secrets)
@@ -99,10 +111,15 @@
     -c "chown {{ pg_run_uid }}:{{ pg_run_gid }} /target/01-create-exporter-user.sql && chmod 0400 /target/01-create-exporter-user.sql"
   changed_when: true
 
-- name: Render this host's docker-compose.yml
+- name: Render docker-compose.yml
+  # Directly in pg_deploy_path - no per-host/extra subdirectory.
+  # pg_deploy_path (Jenkins: DEPLOY_PATH) pins this to exactly one
+  # directory with nothing created outside it - defaults to
+  # pg_project_root (the repo checkout) when not overridden, so
+  # local/manual testing needs no extra flag.
   template:
     src: "{{ pg_project_root }}/templates/docker-compose.yml.j2"
-    dest: "{{ pg_compose_root }}/docker-compose.yml"
+    dest: "{{ pg_deploy_path }}/docker-compose.yml"
     mode: "0640"
 
 - name: Check whether the data directory already exists
@@ -117,7 +134,7 @@
   # itself, only its parent) on subsequent runs, not manage its
   # contents.
   command: >-
-    docker run --rm -v {{ pg_project_root }}:/project
+    docker run --rm -v {{ pg_deploy_path }}:/project
     --entrypoint sh
     {{ pg_postgres_image }}
     -c "mkdir -p /project/data && chown {{ pg_run_uid }}:{{ pg_run_gid }} /project/data && chmod 0700 /project/data"
@@ -131,7 +148,7 @@
 
 - name: Create and hand over the logs directory to the postgres image's own uid (only on first deploy)
   command: >-
-    docker run --rm -v {{ pg_project_root }}:/project
+    docker run --rm -v {{ pg_deploy_path }}:/project
     --entrypoint sh
     {{ pg_postgres_image }}
     -c "mkdir -p /project/logs && chown {{ pg_run_uid }}:{{ pg_run_gid }} /project/logs && chmod 0700 /project/logs"
@@ -139,9 +156,9 @@
   when: not pg_logs_dir_stat.stat.exists
 
 - name: Start (or reconcile) postgres + postgres_exporter
-  command: "{{ pg_compose_cmd }} -f {{ pg_compose_root }}/docker-compose.yml up -d"
+  command: "{{ pg_compose_cmd }} -f {{ pg_deploy_path }}/docker-compose.yml up -d"
   args:
-    chdir: "{{ pg_compose_root }}"
+    chdir: "{{ pg_deploy_path }}"
   changed_when: true
 
 - name: Wait for postgres to become healthy
@@ -153,19 +170,31 @@
   delay: 5
   changed_when: false
 
-- name: Sync the exporter role's password with the current declared secret
+- name: Sync appuser's and the exporter role's passwords with the currently declared secrets
   # docker-entrypoint-initdb.d scripts (including the init SQL rendered
   # above) only ever run once, against a genuinely empty data directory -
-  # a redeploy with a changed pg_exporter_password would otherwise
-  # silently desync from the actual DB role's password. Idempotent
-  # either way (first deploy or redeploy): always brings the role's
-  # password in line with what's currently declared.
+  # a redeploy with a changed pg_password/pg_exporter_password would
+  # otherwise silently desync from the actual DB roles' passwords.
+  #
+  # Connects via `docker exec --user postgres` (no -h, so psql defaults
+  # to the local unix socket) - NOT `-e PGPASSWORD=...` over TCP, which
+  # requires already knowing appuser's CURRENT password to authenticate
+  # at all. Confirmed for real: a redeploy against an existing data
+  # directory with a changed pg_password failed outright ("password
+  # authentication failed for user \"appuser\""), since appuser is the
+  # ONLY superuser here (POSTGRES_USER=appuser removes the default
+  # "postgres" role too) - there was no account left to reset it with.
+  # pg_hba.conf's `local` rule is `peer map=pgmap` (see
+  # templates/pg_ident.conf.j2) specifically to make this possible
+  # without reintroducing `trust`: peer still requires the connecting
+  # process to actually BE this exact container's own "postgres" OS
+  # user, i.e. `docker exec` access to this specific container - not
+  # "any local host user" the way `trust` was.
   command: >-
-    docker exec
-    -e PGPASSWORD={{ pg_password }}
+    docker exec --user postgres
     {{ pg_container_name }}
-    psql -U {{ pg_user }} -d {{ pg_db }} -h 127.0.0.1
-    -c "ALTER USER {{ pg_exporter_user }} WITH PASSWORD '{{ pg_exporter_password }}';"
+    psql -U {{ pg_user }} -d {{ pg_db }}
+    -c "ALTER USER {{ pg_user }} WITH PASSWORD '{{ pg_password }}'; ALTER USER {{ pg_exporter_user }} WITH PASSWORD '{{ pg_exporter_password }}';"
   changed_when: true
 
 - name: Wait for postgres_exporter to become healthy

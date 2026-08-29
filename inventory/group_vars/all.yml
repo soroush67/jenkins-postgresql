@@ -11,18 +11,29 @@
 pg_postgres_image: "docker-hosted.hamainsurance.net/postgres:18.4-alpine3.22"
 pg_exporter_image: "docker-hosted.hamainsurance.net/postgres-exporter:v0.18.1"
 
+# Where this REPO's own checkout lives - only ever used to locate
+# templates/*.j2 (the template *sources* always ship with the repo,
+# regardless of where the deployed stack itself ends up). Never used for
+# deployed artifacts - see pg_deploy_path below, which is a genuinely
+# different concern once it points somewhere other than the Jenkins
+# workspace.
 pg_project_root: "{{ playbook_dir }}/.."
 
+# Where docker-compose.yml + data/config/init/logs actually get created
+# on the target host - defaults to pg_project_root (so local/manual
+# testing needs no extra flag), but is the one thing meant to be
+# overridden per real deployment (Jenkins: DEPLOY_PATH, passed as
+# -e pg_deploy_path=...). Everything this role creates lives under this
+# ONE path and nothing else - no per-host subdirectory, no path derived
+# from anywhere but this variable.
+pg_deploy_path: "{{ pg_project_root }}"
+
 # Matches the original hand-written stack's own relative layout
-# (config/, init/, data/, logs/ next to the compose file) - only the
-# rendered docker-compose.yml itself is host-scoped, for the same reason
-# CockroachDB-Cluster's compose files are: safe if this same mechanism
-# is ever pointed at more than one inventory host sharing a filesystem.
-pg_data_root: "{{ pg_project_root }}/data"
-pg_config_root: "{{ pg_project_root }}/config"
-pg_logs_root: "{{ pg_project_root }}/logs"
-pg_init_root: "{{ pg_project_root }}/init"
-pg_compose_root: "{{ pg_project_root }}/compose/{{ inventory_hostname }}"
+# (config/, init/, data/, logs/ next to the compose file).
+pg_data_root: "{{ pg_deploy_path }}/data"
+pg_config_root: "{{ pg_deploy_path }}/config"
+pg_logs_root: "{{ pg_deploy_path }}/logs"
+pg_init_root: "{{ pg_deploy_path }}/init"
 
 # PRODUCTION: point pg_data_root at a real, dedicated disk mount and set
 # this true - see roles/preflight, which then refuses to deploy unless

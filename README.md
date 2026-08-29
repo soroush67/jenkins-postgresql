@@ -36,6 +36,11 @@ this isn't `--limit` or `-i "<ip>,"`):
 ansible-playbook playbooks/deploy.yml -e target_host=10.0.1.50 -e pg_password='...' -e pg_exporter_password='...'
 ```
 
+Add `-e pg_deploy_path=/opt/pg-stack` (Jenkins: `DEPLOY_PATH`) to pin
+exactly where `docker-compose.yml` + `data`/`config`/`init`/`logs` get
+created - the only path this ever writes to. Defaults to the repo
+checkout directory when not set.
+
 Testing against the public images instead of the internal registry
 (this sandbox can't reach `docker-hosted.hamainsurance.net`):
 
@@ -123,13 +128,55 @@ to *write* into a path or just *read* it:
   `0400` lockout on a later run.
 
 **`docker-entrypoint-initdb.d` scripts only run once, against a
-genuinely empty data directory** - a redeploy with a changed
-`pg_exporter_password` would otherwise silently desync from the actual
-DB role's password (the role already exists, so the init SQL is never
-re-run to pick up the new value). Fixed with a separate `ALTER USER ...
-WITH PASSWORD ...` step that runs on every deploy, idempotently
-resyncing the role's password with whatever's currently declared,
-regardless of whether this is a first deploy or a rerun.
+genuinely empty data directory - and a redeploy with a changed
+`pg_password` couldn't recover from it at all.** Confirmed via a second
+real failed Jenkins run: a redeploy against an existing data directory,
+with the `PG_PASSWORD` credential rotated to a new value, failed
+outright with `FATAL: password authentication failed for user
+"appuser"`. The original fix (a `PGPASSWORD`-based `ALTER USER` for just
+the exporter role) only ever covered `pg_exporter_password`, and even
+that relied on *already* authenticating as `appuser` with the *current*
+`pg_password` - which doesn't help when `pg_password` itself is what
+drifted. Since `POSTGRES_USER=appuser` makes `appuser` the *only*
+superuser here (the default `postgres` role doesn't even exist), there
+was no other account to recover through - and reintroducing `trust` just
+to enable password resets would have undone the whole point of removing
+it.
+
+Fixed properly: `pg_hba.conf`'s `local` rule is `peer map=pgmap` instead
+of `scram-sha-256` (see `templates/pg_ident.conf.j2`) - peer auth still
+needs no password, but only for a connecting process that is actually
+running as this exact container's own `postgres` OS user (uid 70), i.e.
+`docker exec --user postgres` access to *this specific container* - not
+"any local host user" the way `trust` was. Both `appuser`'s own password
+and the exporter role's are now resynced through that local peer
+connection on every deploy (`docker exec --user postgres ... psql -U
+appuser -d appdb -c "ALTER USER ..."`, no `-h`, no remembered password
+needed at all), regardless of whether this is a first deploy or a
+redeploy after a password rotation. Verified for real: deployed with one
+password, redeployed with a different one, confirmed the new password
+works, the old one is now rejected, and that `docker exec --user root`
+(a different OS identity) does *not* get authenticated as `appuser` -
+the peer mapping is scoped to exactly the `postgres` uid, not the whole
+container.
+
+**No way to pin exactly where the stack gets deployed on the target,
+independent of wherever Jenkins happened to check out the repo.**
+`pg_project_root` (`{{ playbook_dir }}/..`) was being used for two
+different things at once: locating this repo's own `templates/*.j2`
+sources, *and* where `data`/`config`/`init`/`logs`/`docker-compose.yml`
+get created - fine as long as those were always the same place, but
+wrong the moment a real deployment needs the stack to live somewhere
+stable (e.g. `/opt/pg-stack`) instead of inside an ephemeral Jenkins
+workspace. Split into two variables: `pg_project_root` stays the repo
+checkout (template sources only, never touched by a deploy target
+change), `pg_deploy_path` (Jenkins: `DEPLOY_PATH`) is the one path
+everything else derives from and gets created under - nothing created
+outside it, no per-host subdirectory. Defaults to `pg_project_root` when
+not overridden, so local/manual testing needs no extra flag. Verified
+directly: a deploy with a custom `pg_deploy_path` created
+`docker-compose.yml`/`data`/`config`/`init`/`logs` only under that one
+path, nothing at the repo root.
 
 **`--limit <ip>` against a static `inventory/hosts.ini` fails outright
 for a destination that was never added to it** - confirmed for real via
