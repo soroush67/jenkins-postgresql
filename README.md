@@ -4,8 +4,10 @@ PostgreSQL 18 + postgres_exporter, deployable to any destination via
 `Jenkins + Ansible + Docker Compose` - same shape as this user's other
 Jenkins/Ansible projects (`gitlab-backup-with-jenkins-ansible`,
 `CockroachDB-Cluster`). Started from a hand-written `docker-compose.yml`
-+ config files that had never actually been run together - three real
-bugs found and fixed along the way, see "Design notes" below.
++ config files that had never actually been run together, and hardened
+against a real failed Jenkins run along the way - see "Design notes"
+below for every real bug found and fixed, not just the ones caught
+before the first deploy.
 
 ## Quickstart
 
@@ -24,10 +26,15 @@ does) a Jenkins credential binding, not typed on a command line that
 ends up in shell history.
 
 `inventory/hosts.ini` ships with a placeholder `localhost
-ansible_connection=local` entry - replace it (or add more) with real
-hosts before a real deployment. "Deploy to any destination" is just
-`--limit <host>` (or pointing at a different inventory) against whatever
-host is in there - no code changes per target.
+ansible_connection=local` entry, used as the fallback when no
+`target_host` is given. "Deploy to any destination" means passing
+`-e target_host=<ip-or-hostname>` per run - it does **not** need to
+already exist in `inventory/hosts.ini` first (see "Design notes" for why
+this isn't `--limit` or `-i "<ip>,"`):
+
+```
+ansible-playbook playbooks/deploy.yml -e target_host=10.0.1.50 -e pg_password='...' -e pg_exporter_password='...'
+```
 
 Testing against the public images instead of the internal registry
 (this sandbox can't reach `docker-hosted.hamainsurance.net`):
@@ -123,6 +130,32 @@ re-run to pick up the new value). Fixed with a separate `ALTER USER ...
 WITH PASSWORD ...` step that runs on every deploy, idempotently
 resyncing the role's password with whatever's currently declared,
 regardless of whether this is a first deploy or a rerun.
+
+**`--limit <ip>` against a static `inventory/hosts.ini` fails outright
+for a destination that was never added to it** - confirmed for real via
+an actual failed Jenkins run: `[WARNING]: Could not match supplied host
+pattern, ignoring: 192.168.12.98` /
+`[ERROR]: Specified inventory, host pattern and/or --limit leaves us
+with no hosts to target.` This broke the entire "deploy to any
+destination" premise, since a real workflow means typing in a different
+IP on every run, not maintaining a growing static inventory file
+per-target. The obvious-looking fix - `-i "<ip>,"` (Ansible's ad-hoc
+single-host inventory syntax) instead of `--limit` - was tried and
+confirmed *not* to work either: `inventory/group_vars/all.yml` never got
+picked up at all (every `pg_*` variable came back undefined), because
+Ansible's `group_vars`/`host_vars` auto-discovery is relative to a real
+inventory *file*'s directory, which an inline ad-hoc string doesn't
+have. The actual fix: a small bootstrap play at the top of both
+`playbooks/deploy.yml` and `playbooks/status.yml` that uses `add_host`
+to inject `target_host` into the *existing* file-based inventory's
+`postgres` group for that one run, then targets exactly that host
+(`hosts: "{{ target_host | default('postgres') }}"`, never the whole
+group, so it doesn't also touch the static placeholder entry). This
+keeps the real inventory file as the `group_vars` discovery root while
+still accepting any destination at runtime - confirmed directly, not
+assumed, including that a `target_host` run touches only itself and a
+target_host-less run correctly falls back to whatever's in
+`inventory/hosts.ini`.
 
 **Verified end-to-end, not just "should work":** `postgres_exporter`'s
 own `/metrics` endpoint returns real `pg_up 1` (not just "container

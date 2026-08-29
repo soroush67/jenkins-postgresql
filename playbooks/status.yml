@@ -1,6 +1,18 @@
 ---
+# Same target_host mechanism as playbooks/deploy.yml - see its comments.
+- name: Register a runtime target host, if one was given
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Add target_host to the postgres group for this run
+      add_host:
+        name: "{{ target_host }}"
+        groups: postgres
+      when: target_host is defined
+
 - name: PostgreSQL stack status (read-only - safe to run anytime)
-  hosts: postgres
+  hosts: "{{ target_host | default('postgres') }}"
   gather_facts: false
   tasks:
     - name: Check container health/running state

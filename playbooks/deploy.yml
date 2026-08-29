@@ -1,6 +1,31 @@
 ---
+# Pass -e target_host=<ip-or-hostname> to deploy to a fresh destination
+# that was never added to inventory/hosts.ini - the whole point of
+# "deploy to any destination" from Jenkins, where a different IP gets
+# typed in on every run. Deliberately NOT `-i "<ip>,"` (ad-hoc inventory)
+# - confirmed directly that form doesn't pick up
+# inventory/group_vars/all.yml at all (group_vars discovery is relative
+# to a real inventory *file*'s directory, which an inline ad-hoc string
+# doesn't have). Dynamically adding the host to the *existing*
+# file-based inventory's postgres group instead keeps group_vars working
+# correctly, confirmed the same way.
+#
+# Without target_host (plain `ansible-playbook playbooks/deploy.yml`),
+# this falls back to whatever's in inventory/hosts.ini - unchanged
+# behavior for local/manual testing.
+- name: Register a runtime target host, if one was given
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Add target_host to the postgres group for this run
+      add_host:
+        name: "{{ target_host }}"
+        groups: postgres
+      when: target_host is defined
+
 - name: Deploy PostgreSQL + postgres_exporter (idempotent - safe to rerun)
-  hosts: postgres
+  hosts: "{{ target_host | default('postgres') }}"
   gather_facts: true
   roles:
     - preflight
