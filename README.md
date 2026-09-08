@@ -19,11 +19,53 @@ ansible-playbook playbooks/deploy.yml \
 ansible-playbook playbooks/status.yml   # read-only health/connectivity check
 ```
 
-`pg_password`/`pg_exporter_password` are required and never committed -
-`roles/preflight` refuses to deploy with either one empty. Real
-deployments should pass these via Ansible Vault or (as the Jenkinsfile
-does) a Jenkins credential binding, not typed on a command line that
-ends up in shell history.
+`pg_password`/`pg_exporter_password` are required - `roles/preflight`
+refuses to deploy with either one empty. `pg_password` already has an
+Ansible-Vault-encrypted default committed in
+`inventory/group_vars/all.yml` (see "Ansible Vault" below) - a plain
+`ansible-playbook playbooks/deploy.yml --ask-vault-pass -e
+pg_exporter_password='...'` works without needing `-e pg_password` at
+all. Jenkins doesn't use the vault default - it passes its own value
+via a Jenkins credential binding (see the Jenkinsfile), which always
+overrides it. `pg_exporter_password` has no committed default - pass it
+via `-e` / Vault / a Jenkins credential binding, not typed on a command
+line that ends up in shell history.
+
+## Ansible Vault
+
+`pg_password` in `inventory/group_vars/all.yml` is Ansible-Vault-
+encrypted - safe to commit and push as-is, since without the vault
+password the file is just ciphertext. To run anything that needs it
+decrypted:
+
+```
+ansible-playbook playbooks/deploy.yml --ask-vault-pass -e pg_exporter_password='...'
+# or, non-interactively:
+echo 'the-vault-password' > .vault-pass && chmod 600 .vault-pass
+ansible-playbook playbooks/deploy.yml --vault-password-file .vault-pass -e pg_exporter_password='...'
+```
+
+**Never commit the vault password itself** (a `.vault-pass` file, if
+you create one for convenience, is already covered by `.gitignore` -
+double check before committing regardless). The vault password is a
+separate secret from the admin password it protects; whoever asked for
+this encrypted value to be set up should already have it out-of-band.
+Verified directly: a real deploy using only `--vault-password-file`/
+`--ask-vault-pass` (no `-e pg_password` at all) decrypts correctly and
+the resulting password actually authenticates against the running
+instance over the real `scram-sha-256` path.
+
+To rotate the encrypted value later:
+```
+ansible-vault encrypt_string --vault-password-file .vault-pass --stdin-name 'pg_password' <<< 'new-password-here'
+```
+paste the resulting `pg_password: !vault |` block over the existing one
+in `inventory/group_vars/all.yml`. Unlike mongo-stack, no separate
+reset playbook is needed here to apply it to an already-running
+instance - `roles/postgres`'s own password-sync step (see "Design
+notes" below, the `peer map=pgmap` mechanism) already runs on every
+deploy and picks up whatever `pg_password` currently resolves to,
+vault-encrypted or not.
 
 `inventory/hosts.ini` ships with a placeholder `localhost
 ansible_connection=local` entry, used as the fallback when no

@@ -68,10 +68,22 @@ pg_exporter_container_name: "pg-exporter"
 
 pg_db: "appdb"
 pg_user: "appuser"
-# Must be set via -e / Ansible Vault / a Jenkins credential binding -
-# never committed. Deploy fails cleanly (roles/postgres asserts this) if
-# left empty.
-pg_password: ""
+# The value below is Ansible-Vault-encrypted (safe to commit as-is -
+# the vault password itself is a separate secret, deliberately NOT
+# documented here or in the README; see README's "Ansible Vault"
+# section only for how to run playbooks against an encrypted value like
+# this one). This is the LOCAL/MANUAL-RUN default only: Jenkins passes
+# its own value via -e (a Jenkins credential binding, see Jenkinsfile),
+# which always overrides this regardless of encryption - Ansible's
+# extra-vars (-e) win over group_vars either way. Deploy fails cleanly
+# (roles/preflight asserts this) if this ever resolves to empty.
+pg_password: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          39366665343963353565633231396339373232616366333763653936323766326165643464616362
+          6439316639353666383162633134353466316532363364320a313035373538613364633731626534
+          39366535343036613866656330636132656663393134383134626538363534303466353766653439
+          6463333761376637350a626461313233353964303530383339313065663733633936366235666562
+          32303639353061656234643732343764626431326430613031373765656166636633
 
 # Was "pg_exporter" in the original init/01-create-exporter-user.sql but
 # "postgres_exporter" in docker-compose.yml's own DATA_SOURCE_NAME - a
