@@ -121,3 +121,16 @@ pg_networks:
 pg_mem_limit: "1024m"
 pg_mem_reservation: "128m"
 pg_cpus: "0.5"
+
+# Log compression/retention - postgresql.conf already has PostgreSQL's
+# own built-in log_rotation_age/log_rotation_size doing the actual
+# rotation into a freshly, uniquely timestamped file every time - but it
+# never compresses or deletes anything on its own, so log files would
+# otherwise accumulate as plain text forever. Runs via this deploying
+# user's own crontab (no become - see roles/postgres) since
+# pg_logs_root's contents are owned by pg_run_uid, not this deploying
+# user, so the actual gzip step happens inside a throwaway container
+# running as that uid instead.
+pg_log_rotate_keep: 14
+pg_log_rotate_hour: "3"
+pg_log_rotate_minute: "45"

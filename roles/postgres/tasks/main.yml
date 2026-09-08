@@ -159,6 +159,36 @@
     dest: "{{ pg_deploy_path }}/docker-compose.yml"
     mode: "0640"
 
+- name: Render the in-container log compression script (runs as the postgres image's own uid)
+  # No secrets in this one - world-readable is fine, but it only ever
+  # runs as an argument to `bash` inside a throwaway container (see
+  # compress-logs-cron.sh below), never executed directly on the host.
+  template:
+    src: "{{ pg_project_root }}/templates/compress-pg-logs.sh.j2"
+    dest: "{{ pg_deploy_path }}/compress-pg-logs.sh"
+    mode: "0644"
+
+- name: Render the host-side log compression cron wrapper
+  # Also no secrets - contains only the image name and paths, all
+  # already visible elsewhere in this same deploy path.
+  template:
+    src: "{{ pg_project_root }}/templates/compress-logs-cron.sh.j2"
+    dest: "{{ pg_deploy_path }}/compress-logs-cron.sh"
+    mode: "0755"
+
+- name: Schedule log compression via this deploying user's own crontab
+  # No become - Ansible's cron module manages the CURRENT user's own
+  # crontab without needing root, consistent with this whole role never
+  # using become/sudo. The actual gzip step still needs the postgres
+  # image's own uid (see compress-pg-logs.sh's own comment for why),
+  # which is why the wrapper script itself does that via a throwaway
+  # container rather than this cron job running as root.
+  cron:
+    name: "pg-stack log compression ({{ pg_container_name }})"
+    minute: "{{ pg_log_rotate_minute }}"
+    hour: "{{ pg_log_rotate_hour }}"
+    job: "{{ pg_deploy_path }}/compress-logs-cron.sh"
+
 - name: Try to ensure the volumes root exists directly
   # /data/<last folder of pg_deploy_path> - a plain, this-deploying-user-
   # owned directory (0755). Only the data/logs subdirectories beneath it

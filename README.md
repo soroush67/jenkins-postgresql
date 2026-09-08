@@ -261,6 +261,45 @@ fallback triggers exactly when it should and not otherwise (confirmed:
 a rerun after the fallback already ran takes the fast direct path again,
 since the directory is now correctly owned).
 
+**`postgresql.conf`'s own log rotation never compressed or deleted
+anything - log files accumulated as plain text forever.**
+`log_rotation_age`/`log_rotation_size` do make PostgreSQL rotate into a
+fresh, uniquely timestamped file
+(`postgresql-%Y-%m-%d_%H%M%S.log`) on its own, but that's genuinely all
+PostgreSQL's built-in rotation does - no gzip, no retention, and since
+every rotated filename is unique, `log_truncate_on_rotation` never even
+gets a chance to reuse (and thus cap) anything either. Fixed by adding
+a cron-scheduled compression+retention step
+(`pg_log_rotate_keep`/`_hour`/`_minute`), same shape as mongo-stack's
+log rotation and the same reasoning for **not** using `become`/root:
+`pg_logs_root`'s contents are owned by `pg_run_uid` (70), mode `0700`
+(handed off once, same as `pg_data_root`) - this deploying user has no
+access to them at all, so the actual `gzip` runs inside a throwaway
+container as that uid instead (`compress-pg-logs.sh`), scheduled via
+this deploying user's own crontab (`compress-logs-cron.sh`, the
+`cron` Ansible module - no `become` needed to manage one's own
+crontab).
+
+No signal to the live server is needed here at all, unlike
+mongo-stack: PostgreSQL's own rotation already produces a uniquely
+named file every time and never reopens or continues writing to an
+older one once rotated away from it - the compression script only ever
+needs to know which single file is the CURRENTLY open one (to leave it
+alone) and gzip everything else. Confirmed directly this can't safely
+be `ls -t`-based (mtime order): two log files compressed moments apart
+in testing landed on an *identical* mtime, making their relative order
+unpredictable and causing retention to delete the wrong one. Fixed by
+sorting on the *filename* instead - PostgreSQL's own `log_filename`
+format already embeds a lexicographically-sortable timestamp, so
+filename order has no such ambiguity. Verified for real via the actual
+rendered templates (not hand-copied scripts): forced several real log
+rotations with `SELECT pg_rotate_logfile();`, confirmed the active file
+is correctly left uncompressed while everything else gets gzip-ed,
+confirmed retention correctly drops the oldest compressed logs beyond
+the configured count, and confirmed `postgres`/`postgres_exporter` stay
+healthy and authenticated throughout (compression never touches the
+active file, so there's nothing to disrupt in the first place).
+
 **Verified end-to-end, not just "should work":** `postgres_exporter`'s
 own `/metrics` endpoint returns real `pg_up 1` (not just "container
 running") after every deploy; two consecutive `deploy.yml` runs left
